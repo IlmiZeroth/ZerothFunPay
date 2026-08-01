@@ -1,0 +1,1 @@
+"""FunPay + Telegram automation bot."""
