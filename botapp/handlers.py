@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import math
+from datetime import date, datetime, time, timedelta, timezone
 
 from aiogram import Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -9,14 +11,18 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 
-from .core import parse_daily_times, shorten
+from .core import next_scheduled_at, parse_daily_times, shorten
+from .database import CategorySchedule
 from .funpay_bridge import FunPayNotConnected
+from .stats import ActivitySummary, minute_series, render_minute_chart, summarize
 
 
 class InputState(StatesGroup):
@@ -33,7 +39,11 @@ def _button(text: str, data: str) -> InlineKeyboardButton:
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [_button("📊 Статус", "status"), _button("🗂 Категории", "cats:0")],
+            [
+                _button("📊 Статус бота", "status"),
+                _button("📈 Подъёмы", "raisestatus:0"),
+            ],
+            [_button("🗂 Категории", "cats:0"), _button("📉 Статистика", "stats")],
             [_button("💬 Автоответ", "auto"), _button("🔔 Уведомления", "notify")],
             [_button("🚨 Напоминания", "reminders")],
             [_button("🛑 Остановить все напоминания", "remstopall")],
@@ -105,17 +115,323 @@ def reminders_page(app: AutomationApp) -> tuple[str, InlineKeyboardMarkup]:
     return body, keyboard
 
 
+def _duration(seconds: float) -> str:
+    remaining = max(0, math.ceil(seconds))
+    if remaining < 60:
+        return f"{remaining} сек."
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} дн.")
+    if hours:
+        parts.append(f"{hours} ч.")
+    if minutes:
+        parts.append(f"{minutes} мин.")
+    if not parts and seconds:
+        parts.append(f"{seconds} сек.")
+    return " ".join(parts[:2])
+
+
+def _category_queue_offsets(
+    categories: list[CategorySchedule], delay_seconds: float
+) -> dict[int, dict[str, float]]:
+    """Mirror scheduler order and accumulate delay separately for every time slot."""
+    positions: dict[str, int] = {}
+    result: dict[int, dict[str, float]] = {}
+    for category in categories:
+        if not category.enabled:
+            continue
+        offsets: dict[str, float] = {}
+        for value in category.times:
+            offsets[value] = positions.get(value, 0) * delay_seconds
+            positions[value] = positions.get(value, 0) + 1
+        result[category.category_id] = offsets
+    return result
+
+
+def _ago(value: datetime, now: datetime) -> str:
+    local = value.astimezone(now.tzinfo)
+    return _duration((now - local).total_seconds()) + " назад"
+
+
+def _category_raise_status(
+    app: AutomationApp,
+    category: CategorySchedule,
+    categories: list[CategorySchedule],
+    now: datetime,
+) -> str:
+    lines: list[str] = []
+    if category.last_attempt_at is None:
+        lines.append("⚪ Последняя попытка: ещё не было")
+    elif category.last_error:
+        lines.append(
+            f"🔴 Последняя попытка: ошибка, {_ago(category.last_attempt_at, now)}"
+        )
+        lines.append(
+            f"Ошибка: <code>{html.escape(shorten(category.last_error, 180))}</code>"
+        )
+        if category.last_success_at:
+            lines.append(f"Последний успех: {_ago(category.last_success_at, now)}")
+        else:
+            lines.append("Последний успех: ещё не было")
+    else:
+        lines.append(f"🟢 Последний подъём: {_ago(category.last_attempt_at, now)}")
+
+    if not category.enabled:
+        lines.append("Следующий: отключён")
+    else:
+        offsets = _category_queue_offsets(
+            categories, app.config.category_raise_delay_seconds
+        ).get(category.category_id, {})
+        next_at, queue_offset = next_scheduled_at(category.times, now, offsets)
+        queue_text = (
+            f", включая +{_duration(queue_offset)} очереди" if queue_offset else ""
+        )
+        lines.append(
+            f"Следующий: через {_duration((next_at - now).total_seconds())} "
+            f"(<code>{next_at.strftime('%d.%m %H:%M:%S')}</code>{queue_text})"
+        )
+
+    if category.next_allowed_at:
+        allowed_at = category.next_allowed_at.astimezone(now.tzinfo)
+        if allowed_at > now:
+            lines.append(
+                "Ограничение FunPay: ещё "
+                f"{_duration((allowed_at - now).total_seconds())}"
+            )
+        else:
+            lines.append("Ограничение FunPay: уже снято")
+    else:
+        lines.append("Ограничение FunPay: нет данных")
+    return "\n".join(lines)
+
+
+def raise_status_page(
+    app: AutomationApp, page: int
+) -> tuple[str, InlineKeyboardMarkup]:
+    page_size = 5
+    categories = app.database.list_categories()
+    total_pages = max(1, math.ceil(len(categories) / page_size))
+    page = min(max(page, 0), total_pages - 1)
+    start = page * page_size
+    now = datetime.now(app.config.timezone)
+    blocks = [
+        f"<b>{html.escape(category.name)}</b>\n"
+        + _category_raise_status(app, category, categories, now)
+        for category in categories[start : start + page_size]
+    ]
+    body = (
+        "<b>Статус подъёмов категорий</b>\n\n"
+        f"Пауза между категориями: <b>{app.config.category_raise_delay_seconds:g} сек.</b> "
+        "Минимальный накопленный сдвиг очереди уже включён в расчёт следующего запуска."
+    )
+    if blocks:
+        body += "\n\n" + "\n\n".join(blocks)
+    else:
+        body += "\n\nКатегории ещё не загружены."
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(_button("◀️", f"raisestatus:{page - 1}"))
+        nav.append(_button(f"{page + 1}/{total_pages}", "noop"))
+        if page + 1 < total_pages:
+            nav.append(_button("▶️", f"raisestatus:{page + 1}"))
+        rows.append(nav)
+    rows.append([_button("🔄 Обновить", f"raisestatus:{page}")])
+    rows.append([_button("🗂 Настроить категории", "cats:0")])
+    rows.append(back_menu())
+    return body, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _summary_text(summary: ActivitySummary) -> str:
+    ratio = (
+        f"{summary.messages_per_raise:.2f}"
+        if summary.messages_per_raise is not None
+        else "нет данных"
+    )
+    after_raise = (
+        f"{summary.messages_within_two_hours} ({summary.after_raise_percent:.1f}%)"
+        if summary.after_raise_percent is not None
+        else "нет данных"
+    )
+    peak = (
+        f"{summary.peak_message_hour:02d}:00–{summary.peak_message_hour:02d}:59"
+        if summary.peak_message_hour is not None
+        else "нет данных"
+    )
+    return (
+        f"Автоподъёмы: <b>{summary.raises}</b>\n"
+        f"Входящие сообщения: <b>{summary.messages}</b>\n"
+        f"Сообщений на один подъём: <b>{ratio}</b>\n"
+        f"Сообщений в первые 2 часа после подъёма: <b>{after_raise}</b>\n"
+        f"Самый активный час сообщений: <b>{peak}</b>"
+    )
+
+
+def statistics_page(app: AutomationApp) -> tuple[str, InlineKeyboardMarkup]:
+    points = app.database.list_activity_points()
+    summary = summarize(points, app.config.timezone)
+    local_dates = [
+        point.occurred_at.astimezone(app.config.timezone).date() for point in points
+    ]
+    period = (
+        f"{min(local_dates).strftime('%d.%m.%Y')} — {max(local_dates).strftime('%d.%m.%Y')}"
+        if local_dates
+        else "данных пока нет"
+    )
+    body = (
+        "<b>Статистика активности</b>\n\n"
+        f"Период: <b>{period}</b>\n"
+        f"{_summary_text(summary)}\n\n"
+        "В базе хранятся только тип события и точное время до секунды — без текста "
+        "сообщений. Суточные и средние графики строятся с шагом в одну минуту.\n\n"
+        "Связь «после подъёма» показывает совпадение по времени, а не доказывает, "
+        "что сообщение пришло именно из-за подъёма."
+    )
+    today = datetime.now(app.config.timezone).date()
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("📅 Сегодня по минутам", f"statsday:{today.isoformat()}")],
+            [
+                _button(
+                    "Вчера",
+                    f"statsday:{(today - timedelta(days=1)).isoformat()}",
+                ),
+                _button("📊 Средний день", "statsavg"),
+            ],
+            back_menu(),
+        ]
+    )
+    return body, keyboard
+
+
+def _day_bounds(day: date, app: AutomationApp) -> tuple[datetime, datetime]:
+    start = datetime.combine(day, time.min, tzinfo=app.config.timezone)
+    end = datetime.combine(
+        day + timedelta(days=1), time.min, tzinfo=app.config.timezone
+    )
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _daily_chart_data(
+    app: AutomationApp, day: date
+) -> tuple[bytes, str, InlineKeyboardMarkup]:
+    since, until = _day_bounds(day, app)
+    points = app.database.list_activity_points(since=since, until=until)
+    context_points = app.database.list_activity_points(
+        since=since - timedelta(hours=2), until=until
+    )
+    summary = summarize(context_points, app.config.timezone, target_day=day)
+    series = minute_series(points, app.config.timezone, target_day=day)
+    png = render_minute_chart(
+        series,
+        title=f"Activity on {day.strftime('%d.%m.%Y')} (1-minute bins)",
+        average=False,
+    )
+    caption = (
+        f"<b>Статистика за {day.strftime('%d.%m.%Y')}</b>\n\n"
+        f"{_summary_text(summary)}\n\n"
+        "Синяя линия — успешные автоподъёмы, оранжевая — входящие сообщения. "
+        "Каждая точка соответствует одной минуте."
+    )
+    today = datetime.now(app.config.timezone).date()
+    navigation = [
+        _button("◀️ День", f"statsday:{(day - timedelta(days=1)).isoformat()}")
+    ]
+    if day < today:
+        navigation.append(
+            _button("День ▶️", f"statsday:{(day + timedelta(days=1)).isoformat()}")
+        )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            navigation,
+            [_button("Сегодня", f"statsday:{today.isoformat()}")],
+            [_button("📊 Средний день", "statsavg")],
+            [_button("⬅️ К статистике", "stats")],
+        ]
+    )
+    return png, caption, keyboard
+
+
+def _average_chart_data(app: AutomationApp) -> tuple[bytes, str, InlineKeyboardMarkup]:
+    points = app.database.list_activity_points()
+    series = minute_series(points, app.config.timezone, average=True)
+    summary = summarize(points, app.config.timezone)
+    png = render_minute_chart(
+        series,
+        title=f"Average day across {series.days} calendar day(s) (1-minute bins)",
+        average=True,
+    )
+    if series.first_day and series.last_day:
+        period = (
+            f"{series.first_day.strftime('%d.%m.%Y')} — "
+            f"{series.last_day.strftime('%d.%m.%Y')}"
+        )
+    else:
+        period = "данных пока нет"
+    caption = (
+        "<b>Средний суточный график за всё время</b>\n\n"
+        f"Период: <b>{period}</b>\n"
+        f"Календарных дней в расчёте: <b>{series.days}</b>\n"
+        f"{_summary_text(summary)}\n\n"
+        "Для каждой минуты показано среднее количество событий в день."
+    )
+    today = datetime.now(app.config.timezone).date()
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [_button("📅 Сегодня", f"statsday:{today.isoformat()}")],
+            [_button("⬅️ К статистике", "stats")],
+        ]
+    )
+    return png, caption, keyboard
+
+
+async def _show_chart(
+    callback: CallbackQuery,
+    png: bytes,
+    caption: str,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    if not callback.message:
+        return
+    if callback.message.photo:
+        try:
+            await callback.message.edit_media(
+                InputMediaPhoto(
+                    media=BufferedInputFile(png, filename="funpay-statistics.png"),
+                    caption=caption,
+                    parse_mode="HTML",
+                ),
+                reply_markup=keyboard,
+            )
+            return
+        except TelegramBadRequest:
+            pass
+    await callback.message.answer_photo(
+        photo=BufferedInputFile(png, filename="funpay-statistics.png"),
+        caption=caption,
+        reply_markup=keyboard,
+    )
+
+
 def category_page(
     app: AutomationApp, category_id: int
 ) -> tuple[str, InlineKeyboardMarkup]:
     category = app.database.get_category(category_id)
     if category is None:
         raise KeyError(category_id)
+    categories = app.database.list_categories()
+    now = datetime.now(app.config.timezone)
     body = (
         f"<b>{html.escape(category.name)}</b>\n\n"
         f"Подъём: {'🟢 включён' if category.enabled else '🔴 выключен'}\n"
         f"Расписание: <code>{' · '.join(category.times)}</code>\n"
-        f"ID категории: <code>{category.category_id}</code>"
+        f"ID категории: <code>{category.category_id}</code>\n\n"
+        f"{_category_raise_status(app, category, categories, now)}"
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -127,6 +443,7 @@ def category_page(
             ],
             [_button("🕒 Изменить время", f"cat:times:{category_id}")],
             [_button("⬆️ Поднять сейчас", f"cat:now:{category_id}")],
+            [_button("📈 Все статусы", "raisestatus:0")],
             [_button("⬅️ К категориям", "cats:0")],
         ]
     )
@@ -159,6 +476,7 @@ def categories_page(app: AutomationApp, page: int) -> tuple[str, InlineKeyboardM
             nav.append(_button("▶️", f"cats:{page + 1}"))
         rows.append(nav)
     rows.append([_button("🔄 Синхронизировать с FunPay", "cats:sync")])
+    rows.append([_button("📈 Статус подъёмов", "raisestatus:0")])
     rows.append(back_menu())
     body = (
         "<b>Категории и расписание подъёма</b>\n\n"
@@ -174,6 +492,9 @@ async def _edit(
     callback: CallbackQuery, text: str, keyboard: InlineKeyboardMarkup
 ) -> None:
     if not callback.message:
+        return
+    if callback.message.photo:
+        await callback.message.answer(text, reply_markup=keyboard)
         return
     try:
         await callback.message.edit_text(text, reply_markup=keyboard)
@@ -286,6 +607,32 @@ def build_dispatcher(app: AutomationApp) -> Dispatcher:
     async def status_callback(callback: CallbackQuery) -> None:
         await callback.answer()
         await _edit(callback, app.status_text(), main_menu())
+
+    @router.callback_query(F.data == "stats")
+    async def statistics_callback(callback: CallbackQuery) -> None:
+        await callback.answer()
+        await _edit(callback, *statistics_page(app))
+
+    @router.callback_query(F.data.regexp(r"^statsday:\d{4}-\d{2}-\d{2}$"))
+    async def statistics_day_callback(callback: CallbackQuery) -> None:
+        await callback.answer("Строю график…")
+        requested = date.fromisoformat((callback.data or "").split(":", 1)[1])
+        today = datetime.now(app.config.timezone).date()
+        day = min(requested, today)
+        png, caption, keyboard = await asyncio.to_thread(_daily_chart_data, app, day)
+        await _show_chart(callback, png, caption, keyboard)
+
+    @router.callback_query(F.data == "statsavg")
+    async def statistics_average_callback(callback: CallbackQuery) -> None:
+        await callback.answer("Считаю средний день…")
+        png, caption, keyboard = await asyncio.to_thread(_average_chart_data, app)
+        await _show_chart(callback, png, caption, keyboard)
+
+    @router.callback_query(F.data.regexp(r"^raisestatus:\d+$"))
+    async def raise_status_callback(callback: CallbackQuery) -> None:
+        page = int((callback.data or "0").split(":")[1])
+        await callback.answer()
+        await _edit(callback, *raise_status_page(app, page))
 
     @router.callback_query(F.data == "auto")
     async def auto_callback(callback: CallbackQuery) -> None:
@@ -448,6 +795,7 @@ def build_dispatcher(app: AutomationApp) -> Dispatcher:
         await callback.answer("Запускаю поднятие…")
         try:
             await app.raise_now(category_id)
+            await _edit(callback, *category_page(app, category_id))
         except FunPayNotConnected:
             if callback.message:
                 await callback.message.answer("FunPay ещё не подключён.")

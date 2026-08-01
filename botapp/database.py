@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .core import DEFAULT_RAISE_TIMES, parse_daily_times
@@ -22,6 +22,10 @@ DEFAULT_SETTINGS = {
     "reminder_interval_seconds": "1.1",
 }
 
+ACTIVITY_AUTO_RAISE = "auto_raise"
+ACTIVITY_MESSAGE = "message"
+ACTIVITY_KINDS = frozenset({ACTIVITY_AUTO_RAISE, ACTIVITY_MESSAGE})
+
 
 @dataclass(frozen=True, slots=True)
 class CategorySchedule:
@@ -30,6 +34,11 @@ class CategorySchedule:
     enabled: bool
     times: tuple[str, ...]
     last_slot: str | None
+    last_attempt_at: datetime | None
+    last_success_at: datetime | None
+    last_error: str | None
+    last_wait_seconds: int | None
+    next_allowed_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +51,13 @@ class PendingNotification:
     funpay_message_id: int | None
     telegram_message_id: int | None
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityPoint:
+    kind: str
+    occurred_at: datetime
+    category_id: int | None
 
 
 class Database:
@@ -72,7 +88,12 @@ class Database:
                     name TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
                     times_json TEXT NOT NULL,
-                    last_slot TEXT
+                    last_slot TEXT,
+                    last_attempt_at TEXT,
+                    last_success_at TEXT,
+                    last_error TEXT,
+                    last_wait_seconds INTEGER,
+                    next_allowed_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS contacts (
@@ -98,8 +119,38 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS notifications_pending_idx
                 ON notifications(is_first, acknowledged_at, stopped_at);
+
+                CREATE TABLE IF NOT EXISTS activity_points (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL CHECK(kind IN ('auto_raise', 'message')),
+                    occurred_at INTEGER NOT NULL,
+                    category_id INTEGER,
+                    source_key TEXT,
+                    UNIQUE(kind, source_key)
+                );
+
+                CREATE INDEX IF NOT EXISTS activity_points_time_idx
+                ON activity_points(occurred_at);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(category_schedules)"
+                ).fetchall()
+            }
+            migrations = {
+                "last_attempt_at": "TEXT",
+                "last_success_at": "TEXT",
+                "last_error": "TEXT",
+                "last_wait_seconds": "INTEGER",
+                "next_allowed_at": "TEXT",
+            }
+            for column, data_type in migrations.items():
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE category_schedules ADD COLUMN {column} {data_type}"
+                    )
             connection.executemany(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                 DEFAULT_SETTINGS.items(),
@@ -152,12 +203,25 @@ class Database:
 
     @staticmethod
     def _category_from_row(row: sqlite3.Row) -> CategorySchedule:
+        def parse_datetime(column: str) -> datetime | None:
+            value = row[column]
+            return datetime.fromisoformat(str(value)) if value else None
+
         return CategorySchedule(
             category_id=int(row["category_id"]),
             name=str(row["name"]),
             enabled=bool(row["enabled"]),
             times=tuple(json.loads(row["times_json"])),
             last_slot=row["last_slot"],
+            last_attempt_at=parse_datetime("last_attempt_at"),
+            last_success_at=parse_datetime("last_success_at"),
+            last_error=str(row["last_error"]) if row["last_error"] else None,
+            last_wait_seconds=(
+                int(row["last_wait_seconds"])
+                if row["last_wait_seconds"] is not None
+                else None
+            ),
+            next_allowed_at=parse_datetime("next_allowed_at"),
         )
 
     def list_categories(self) -> list[CategorySchedule]:
@@ -211,6 +275,50 @@ class Database:
                 (current_slot, category_id, current_slot),
             )
         return bool(cursor.rowcount)
+
+    def record_raise_result(
+        self,
+        category_id: int,
+        *,
+        success: bool,
+        error: str | None = None,
+        wait_seconds: int | None = None,
+        attempted_at: datetime | None = None,
+    ) -> None:
+        attempted_at = attempted_at or datetime.now(timezone.utc)
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+        normalized_wait = (
+            max(0, int(wait_seconds)) if wait_seconds is not None else None
+        )
+        next_allowed_at = (
+            attempted_at + timedelta(seconds=normalized_wait)
+            if normalized_wait is not None
+            else None
+        )
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE category_schedules
+                SET last_attempt_at = ?,
+                    last_success_at = CASE WHEN ? = 1 THEN ? ELSE last_success_at END,
+                    last_error = ?,
+                    last_wait_seconds = ?,
+                    next_allowed_at = ?
+                WHERE category_id = ?
+                """,
+                (
+                    attempted_at.isoformat(),
+                    int(success),
+                    attempted_at.isoformat(),
+                    None if success else (error or "Неизвестная ошибка"),
+                    normalized_wait,
+                    next_allowed_at.isoformat() if next_allowed_at else None,
+                    category_id,
+                ),
+            )
+        if not cursor.rowcount:
+            raise KeyError(category_id)
 
     def register_contact(
         self, chat_id: str, user_id: int | None, username: str
@@ -377,3 +485,63 @@ class Database:
                 """
             ).fetchone()
         return int(row["total"])
+
+    def add_activity_point(
+        self,
+        kind: str,
+        *,
+        occurred_at: datetime | None = None,
+        category_id: int | None = None,
+        source_key: str | None = None,
+    ) -> bool:
+        if kind not in ACTIVITY_KINDS:
+            raise ValueError(f"Неизвестный тип точки статистики: {kind}")
+        occurred_at = occurred_at or datetime.now(timezone.utc)
+        if occurred_at.tzinfo is None:
+            occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+        timestamp = int(occurred_at.timestamp())
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO activity_points(
+                    kind, occurred_at, category_id, source_key
+                ) VALUES(?, ?, ?, ?)
+                """,
+                (kind, timestamp, category_id, source_key),
+            )
+        return bool(cursor.rowcount)
+
+    def list_activity_points(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[ActivityPoint]:
+        conditions: list[str] = []
+        parameters: list[int] = []
+        if since is not None:
+            conditions.append("occurred_at >= ?")
+            parameters.append(int(since.timestamp()))
+        if until is not None:
+            conditions.append("occurred_at < ?")
+            parameters.append(int(until.timestamp()))
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT kind, occurred_at, category_id FROM activity_points"
+                + where
+                + " ORDER BY occurred_at, id",
+                parameters,
+            ).fetchall()
+        return [
+            ActivityPoint(
+                kind=str(row["kind"]),
+                occurred_at=datetime.fromtimestamp(
+                    int(row["occurred_at"]), tz=timezone.utc
+                ),
+                category_id=(
+                    int(row["category_id"]) if row["category_id"] is not None else None
+                ),
+            )
+            for row in rows
+        ]

@@ -1,6 +1,7 @@
 aiogram==3.30.0
 beautifulsoup4==4.15.0
 lxml==6.1.1
+Pillow==12.3.0
 python-dotenv==1.2.2
 requests==2.34.2
 tzdata==2026.3

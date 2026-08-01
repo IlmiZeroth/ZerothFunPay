@@ -22,6 +22,7 @@ class AppConfig:
     timezone: ZoneInfo
     database_path: Path
     funpay_poll_seconds: float = 4.0
+    category_raise_delay_seconds: float = 4.0
 
     @classmethod
     def from_env(cls, base_dir: Path) -> AppConfig:
@@ -65,6 +66,18 @@ class AppConfig:
         except ValueError as exc:
             raise ConfigError("FUNPAY_POLL_SECONDS должен быть числом.") from exc
 
+        raise_delay_raw = os.getenv("CATEGORY_RAISE_DELAY_SECONDS", "4").strip()
+        try:
+            raise_delay_seconds = float(raise_delay_raw)
+        except ValueError as exc:
+            raise ConfigError(
+                "CATEGORY_RAISE_DELAY_SECONDS должен быть числом."
+            ) from exc
+        if not 3.0 <= raise_delay_seconds <= 60.0:
+            raise ConfigError(
+                "CATEGORY_RAISE_DELAY_SECONDS должен быть от 3 до 60 секунд."
+            )
+
         db_raw = os.getenv("DATABASE_PATH", "data/bot.sqlite3").strip()
         database_path = Path(db_raw)
         if not database_path.is_absolute():
@@ -79,4 +92,5 @@ class AppConfig:
             timezone=timezone,
             database_path=database_path,
             funpay_poll_seconds=poll_seconds,
+            category_raise_delay_seconds=raise_delay_seconds,
         )

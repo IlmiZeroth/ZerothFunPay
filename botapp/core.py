@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
-from datetime import datetime
+from collections.abc import Iterable, Mapping
+from datetime import datetime, time, timedelta
 
 DEFAULT_RAISE_TIMES = ("06:37", "10:37", "14:37", "18:37", "22:37", "02:37")
 _TIME_RE = re.compile(r"^(?P<hour>\d{1,2}):(?P<minute>\d{2})$")
@@ -36,6 +36,31 @@ def parse_daily_times(value: str | Iterable[str]) -> list[str]:
 def slot_key(now: datetime) -> str:
     """Return a durable once-per-day/minute scheduler key."""
     return now.strftime("%Y-%m-%d %H:%M")
+
+
+def next_scheduled_at(
+    times: Iterable[str],
+    now: datetime,
+    offsets_seconds: Mapping[str, float] | None = None,
+) -> tuple[datetime, float]:
+    """Return the next daily slot and its accumulated queue offset."""
+    offsets = offsets_seconds or {}
+    candidates: list[tuple[datetime, float]] = []
+    for day_offset in (0, 1):
+        day = now.date() + timedelta(days=day_offset)
+        for value in times:
+            hour, minute = (int(part) for part in value.split(":"))
+            offset = max(0.0, float(offsets.get(value, 0.0)))
+            candidate = datetime.combine(
+                day,
+                time(hour=hour, minute=minute),
+                tzinfo=now.tzinfo,
+            ) + timedelta(seconds=offset)
+            if candidate > now:
+                candidates.append((candidate, offset))
+    if not candidates:
+        raise ValueError("Расписание не содержит будущего времени.")
+    return min(candidates, key=lambda item: item[0])
 
 
 def shorten(value: str | None, limit: int = 120) -> str:

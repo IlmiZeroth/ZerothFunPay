@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 from aiogram import Bot, Dispatcher
@@ -14,7 +15,12 @@ from aiogram.types import BotCommand, InlineKeyboardMarkup
 
 from .config import AppConfig
 from .core import shorten, slot_key
-from .database import CategorySchedule, Database
+from .database import (
+    ACTIVITY_AUTO_RAISE,
+    ACTIVITY_MESSAGE,
+    CategorySchedule,
+    Database,
+)
 from .funpay_bridge import FunPayBridge, FunPayNotConnected
 from .reminders import ReminderManager, acknowledgement_keyboard
 
@@ -42,6 +48,7 @@ class AutomationApp:
         self.dispatcher: Dispatcher | None = None
         self._tasks: list[asyncio.Task[Any]] = []
         self._raise_lock = asyncio.Lock()
+        self._last_raise_finished_monotonic: float | None = None
         self._last_connection_error: str | None = None
 
     async def start(self) -> None:
@@ -122,6 +129,12 @@ class AutomationApp:
             return
         if getattr(message, "by_bot", False) or getattr(message, "by_vertex", False):
             return
+
+        self.database.add_activity_point(
+            ACTIVITY_MESSAGE,
+            occurred_at=datetime.now(timezone.utc),
+            source_key=f"{message.chat_id}:{message.id}",
+        )
 
         author = message.author or message.chat_name or "Без имени"
         user_id = message.interlocutor_id or message.author_id or None
@@ -262,6 +275,7 @@ class AutomationApp:
                 current_time = now.strftime("%H:%M")
                 current_slot = slot_key(now)
                 if self.funpay.connected:
+                    claimed: list[CategorySchedule] = []
                     for category in self.database.list_categories():
                         if (
                             category.enabled
@@ -270,52 +284,139 @@ class AutomationApp:
                                 category.category_id, current_slot
                             )
                         ):
-                            asyncio.create_task(
-                                self._raise_and_report(category, scheduled=True),
-                                name=f"raise-{category.category_id}-{current_slot}",
-                            )
+                            claimed.append(category)
+                    if claimed:
+                        asyncio.create_task(
+                            self._raise_batch(claimed),
+                            name=f"raise-batch-{current_slot}",
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Ошибка планировщика поднятий")
             await asyncio.sleep(10)
 
-    async def _raise_and_report(
+    async def _raise_batch(self, categories: list[CategorySchedule]) -> None:
+        for category in categories:
+            await self._raise_and_record(category, scheduled=True)
+
+    async def _call_raise_with_spacing(
+        self, category_id: int, *, minimum_wait: float = 0.0
+    ) -> int | None:
+        if self._last_raise_finished_monotonic is not None:
+            elapsed = time.monotonic() - self._last_raise_finished_monotonic
+            required = max(
+                self.config.category_raise_delay_seconds,
+                max(0.0, minimum_wait),
+            )
+            if elapsed < required:
+                await asyncio.sleep(required - elapsed)
+        try:
+            return await self.funpay.raise_category(category_id)
+        finally:
+            # The delay is measured after the previous request has completed. This
+            # makes it accumulate correctly for batches of any size.
+            self._last_raise_finished_monotonic = time.monotonic()
+
+    @staticmethod
+    def _raise_error(exc: Exception) -> tuple[str, int | None]:
+        raw_wait = getattr(exc, "wait_time", None)
+        try:
+            wait = max(0, int(raw_wait)) if raw_wait is not None else None
+        except (TypeError, ValueError):
+            wait = None
+        detail = getattr(exc, "error_message", None) or str(exc) or type(exc).__name__
+        return detail, wait
+
+    def _record_raise_success(
+        self,
+        category: CategorySchedule,
+        wait_seconds: int | None,
+        *,
+        scheduled: bool,
+    ) -> None:
+        occurred_at = datetime.now(timezone.utc)
+        self.database.record_raise_result(
+            category.category_id,
+            success=True,
+            wait_seconds=wait_seconds,
+            attempted_at=occurred_at,
+        )
+        if scheduled:
+            self.database.add_activity_point(
+                ACTIVITY_AUTO_RAISE,
+                occurred_at=occurred_at,
+                category_id=category.category_id,
+            )
+
+    async def _raise_and_record(
         self, category: CategorySchedule, *, scheduled: bool
-    ) -> str:
+    ) -> bool:
         async with self._raise_lock:
             source = "по расписанию" if scheduled else "вручную"
             try:
-                wait_seconds = await self.funpay.raise_category(category.category_id)
-                wait_text = (
-                    f" Следующее разрешённое поднятие примерно через {wait_seconds} сек."
-                    if wait_seconds
-                    else ""
+                wait_seconds = await self._call_raise_with_spacing(category.category_id)
+            except Exception as exc:  # noqa: BLE001 - persist any upstream raise failure.
+                detail, wait = self._raise_error(exc)
+                if wait is not None and 0 < wait <= 10:
+                    logger.warning(
+                        "FunPay попросил подождать %s сек. для категории %s; повторяю один раз",
+                        wait,
+                        category.category_id,
+                    )
+                    try:
+                        wait_seconds = await self._call_raise_with_spacing(
+                            category.category_id,
+                            minimum_wait=wait,
+                        )
+                    except Exception as retry_exc:  # noqa: BLE001 - persist retry failure too.
+                        detail, wait = self._raise_error(retry_exc)
+                    else:
+                        self._record_raise_success(
+                            category,
+                            wait_seconds,
+                            scheduled=scheduled,
+                        )
+                        logger.info(
+                            "Категория %s поднята %s после автоматического повтора",
+                            category.category_id,
+                            source,
+                        )
+                        return True
+                self.database.record_raise_result(
+                    category.category_id,
+                    success=False,
+                    error=detail,
+                    wait_seconds=wait,
+                    attempted_at=datetime.now(timezone.utc),
                 )
-                text = f"⬆️ <b>{html.escape(category.name)}</b>: лоты подняты {source}.{wait_text}"
-            except Exception as exc:
-                logger.exception("Ошибка поднятия категории %s", category.category_id)
-                wait = getattr(exc, "wait_time", None)
-                detail = (
-                    getattr(exc, "error_message", None)
-                    or str(exc)
-                    or type(exc).__name__
+                logger.error(
+                    "Категория %s не поднята %s: %s",
+                    category.category_id,
+                    source,
+                    detail,
                 )
-                suffix = f" Ожидание FunPay: {wait} сек." if wait else ""
-                text = (
-                    f"⚠️ <b>{html.escape(category.name)}</b>: поднятие {source} не выполнено. "
-                    f"<code>{html.escape(shorten(detail, 600))}</code>{suffix}"
-                )
-            await self._safe_admin_message(text)
-            return text
+                return False
 
-    async def raise_now(self, category_id: int) -> str:
+            self._record_raise_success(
+                category,
+                wait_seconds,
+                scheduled=scheduled,
+            )
+            logger.info(
+                "Категория %s поднята %s",
+                category.category_id,
+                source,
+            )
+            return True
+
+    async def raise_now(self, category_id: int) -> bool:
         category = self.database.get_category(category_id)
         if category is None:
             raise KeyError(category_id)
         if not self.funpay.connected:
             raise FunPayNotConnected("FunPay ещё не подключён.")
-        return await self._raise_and_report(category, scheduled=False)
+        return await self._raise_and_record(category, scheduled=False)
 
     async def _session_refresh_loop(self) -> None:
         while True:
