@@ -39,6 +39,9 @@ class CategorySchedule:
     last_error: str | None
     last_wait_seconds: int | None
     next_allowed_at: datetime | None
+    retry_at: datetime | None
+    retry_claimed_until: datetime | None
+    retry_attempts: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +96,10 @@ class Database:
                     last_success_at TEXT,
                     last_error TEXT,
                     last_wait_seconds INTEGER,
-                    next_allowed_at TEXT
+                    next_allowed_at TEXT,
+                    retry_at TEXT,
+                    retry_claimed_until TEXT,
+                    retry_attempts INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS contacts (
@@ -145,12 +151,37 @@ class Database:
                 "last_error": "TEXT",
                 "last_wait_seconds": "INTEGER",
                 "next_allowed_at": "TEXT",
+                "retry_at": "TEXT",
+                "retry_claimed_until": "TEXT",
+                "retry_attempts": "INTEGER NOT NULL DEFAULT 0",
             }
             for column, data_type in migrations.items():
                 if column not in columns:
                     connection.execute(
                         f"ALTER TABLE category_schedules ADD COLUMN {column} {data_type}"
                     )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS category_schedules_retry_idx
+                ON category_schedules(enabled, retry_at, retry_claimed_until)
+                """
+            )
+            # Recover failed raises created by older versions which did not have a
+            # durable retry queue. If FunPay's cooldown has already elapsed, they
+            # become due immediately after the upgrade.
+            connection.execute(
+                """
+                UPDATE category_schedules
+                SET retry_at = COALESCE(next_allowed_at, ?)
+                WHERE last_error IS NOT NULL AND retry_at IS NULL
+                """,
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+            # No in-process task survives a restart, so stale leases can be
+            # released immediately while keeping the durable retry time.
+            connection.execute(
+                "UPDATE category_schedules SET retry_claimed_until = NULL"
+            )
             connection.executemany(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
                 DEFAULT_SETTINGS.items(),
@@ -222,6 +253,9 @@ class Database:
                 else None
             ),
             next_allowed_at=parse_datetime("next_allowed_at"),
+            retry_at=parse_datetime("retry_at"),
+            retry_claimed_until=parse_datetime("retry_claimed_until"),
+            retry_attempts=int(row["retry_attempts"] or 0),
         )
 
     def list_categories(self) -> list[CategorySchedule]:
@@ -262,19 +296,83 @@ class Database:
             if not cursor.rowcount:
                 raise KeyError(category_id)
 
-    def claim_raise_slot(self, category_id: int, current_slot: str) -> bool:
+    def claim_raise_slot(
+        self,
+        category_id: int,
+        current_slot: str,
+        *,
+        retry_claimed_until: datetime | None = None,
+    ) -> bool:
         """Atomically reserve a category/time slot so it runs at most once."""
+        if retry_claimed_until is not None:
+            if retry_claimed_until.tzinfo is None:
+                retry_claimed_until = retry_claimed_until.replace(tzinfo=timezone.utc)
+            else:
+                retry_claimed_until = retry_claimed_until.astimezone(timezone.utc)
+        claimed_until = retry_claimed_until.isoformat() if retry_claimed_until else None
         with self._lock, self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE category_schedules
-                SET last_slot = ?
+                SET last_slot = ?,
+                    retry_claimed_until = CASE
+                        WHEN retry_at IS NOT NULL AND ? IS NOT NULL THEN ?
+                        ELSE retry_claimed_until
+                    END
                 WHERE category_id = ? AND enabled = 1
                   AND (last_slot IS NULL OR last_slot <> ?)
                 """,
-                (current_slot, category_id, current_slot),
+                (
+                    current_slot,
+                    claimed_until,
+                    claimed_until,
+                    category_id,
+                    current_slot,
+                ),
             )
         return bool(cursor.rowcount)
+
+    def claim_due_raise_retries(
+        self,
+        now: datetime,
+        *,
+        lease_seconds: int = 15 * 60,
+    ) -> list[CategorySchedule]:
+        """Lease due retries so a crash recovers them without duplicate tasks."""
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        else:
+            now = now.astimezone(timezone.utc)
+        now_iso = now.isoformat()
+        lease_until = (now + timedelta(seconds=lease_seconds)).isoformat()
+        claimed: list[CategorySchedule] = []
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM category_schedules
+                WHERE enabled = 1 AND retry_at IS NOT NULL AND retry_at <= ?
+                  AND (
+                    retry_claimed_until IS NULL OR retry_claimed_until <= ?
+                  )
+                ORDER BY name COLLATE NOCASE
+                """,
+                (now_iso, now_iso),
+            ).fetchall()
+            for row in rows:
+                cursor = connection.execute(
+                    """
+                    UPDATE category_schedules
+                    SET retry_claimed_until = ?
+                    WHERE category_id = ? AND retry_at IS NOT NULL AND retry_at <= ?
+                      AND (
+                        retry_claimed_until IS NULL OR retry_claimed_until <= ?
+                      )
+                    """,
+                    (lease_until, int(row["category_id"]), now_iso, now_iso),
+                )
+                if cursor.rowcount:
+                    claimed.append(self._category_from_row(row))
+        return claimed
 
     def record_raise_result(
         self,
@@ -284,10 +382,17 @@ class Database:
         error: str | None = None,
         wait_seconds: int | None = None,
         attempted_at: datetime | None = None,
+        retry_at: datetime | None = None,
     ) -> None:
         attempted_at = attempted_at or datetime.now(timezone.utc)
         if attempted_at.tzinfo is None:
             attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+        else:
+            attempted_at = attempted_at.astimezone(timezone.utc)
+        if retry_at is not None and retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        elif retry_at is not None:
+            retry_at = retry_at.astimezone(timezone.utc)
         normalized_wait = (
             max(0, int(wait_seconds)) if wait_seconds is not None else None
         )
@@ -304,7 +409,13 @@ class Database:
                     last_success_at = CASE WHEN ? = 1 THEN ? ELSE last_success_at END,
                     last_error = ?,
                     last_wait_seconds = ?,
-                    next_allowed_at = ?
+                    next_allowed_at = ?,
+                    retry_at = CASE WHEN ? = 1 THEN NULL ELSE ? END,
+                    retry_claimed_until = NULL,
+                    retry_attempts = CASE
+                        WHEN ? = 1 THEN 0
+                        ELSE retry_attempts + 1
+                    END
                 WHERE category_id = ?
                 """,
                 (
@@ -314,6 +425,9 @@ class Database:
                     None if success else (error or "Неизвестная ошибка"),
                     normalized_wait,
                     next_allowed_at.isoformat() if next_allowed_at else None,
+                    int(success),
+                    retry_at.isoformat() if retry_at else None,
+                    int(success),
                     category_id,
                 ),
             )
@@ -446,7 +560,7 @@ class Database:
             cursor = connection.execute(
                 """
                 UPDATE notifications SET acknowledged_at = ?
-                WHERE id = ? AND acknowledged_at IS NULL
+                WHERE id = ? AND is_first = 1 AND acknowledged_at IS NULL
                 """,
                 (now, notification_id),
             )
@@ -458,7 +572,8 @@ class Database:
             cursor = connection.execute(
                 """
                 UPDATE notifications SET stopped_at = ?
-                WHERE id = ? AND acknowledged_at IS NULL AND stopped_at IS NULL
+                WHERE id = ? AND is_first = 1
+                  AND acknowledged_at IS NULL AND stopped_at IS NULL
                 """,
                 (now, notification_id),
             )
@@ -470,7 +585,8 @@ class Database:
             cursor = connection.execute(
                 """
                 UPDATE notifications SET stopped_at = ?
-                WHERE acknowledged_at IS NULL AND stopped_at IS NULL
+                WHERE is_first = 1
+                  AND acknowledged_at IS NULL AND stopped_at IS NULL
                 """,
                 (now,),
             )

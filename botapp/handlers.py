@@ -194,6 +194,27 @@ def _category_raise_status(
             f"(<code>{next_at.strftime('%d.%m %H:%M:%S')}</code>{queue_text})"
         )
 
+    if category.retry_at:
+        retry_at = category.retry_at.astimezone(now.tzinfo)
+        if not category.enabled:
+            retry_text = "приостановлен — категория выключена"
+        elif retry_at > now:
+            retry_text = (
+                f"через {_duration((retry_at - now).total_seconds())} "
+                f"(<code>{retry_at.strftime('%d.%m %H:%M:%S')}</code>)"
+            )
+        elif (
+            category.retry_claimed_until
+            and category.retry_claimed_until.astimezone(now.tzinfo) > now
+        ):
+            retry_text = "уже поставлен в очередь"
+        else:
+            retry_text = "готов к запуску"
+        lines.append(
+            f"Автоповтор: <b>{retry_text}</b> "
+            f"(ошибок подряд: {category.retry_attempts})"
+        )
+
     if category.next_allowed_at:
         allowed_at = category.next_allowed_at.astimezone(now.tzinfo)
         if allowed_at > now:
@@ -678,6 +699,8 @@ def build_dispatcher(app: AutomationApp) -> Dispatcher:
         app.database.set_bool("reminders_enabled", enabled)
         if not enabled:
             app.reminders.stop_all()
+        else:
+            await app.reminders.restore()
         await callback.answer("Включены" if enabled else "Выключены")
         await _edit(callback, *reminders_page(app))
 

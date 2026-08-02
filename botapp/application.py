@@ -4,7 +4,7 @@ import asyncio
 import html
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aiogram import Bot, Dispatcher
@@ -176,22 +176,27 @@ class AutomationApp:
         if not self.database.get_bool("notifications_enabled", True):
             return
 
-        notification = self.database.create_notification(
-            chat_id=str(message.chat_id),
-            user_id=user_id,
-            author=author,
-            message_text=message.text,
-            funpay_message_id=message.id,
-            is_first=is_first,
-        )
-        keyboard = acknowledgement_keyboard(notification.id) if is_first else None
+        notification = None
+        keyboard = None
+        if is_first:
+            notification = self.database.create_notification(
+                chat_id=str(message.chat_id),
+                user_id=user_id,
+                author=author,
+                message_text=message.text,
+                funpay_message_id=message.id,
+                is_first=True,
+            )
+            keyboard = acknowledgement_keyboard(notification.id)
         telegram_message_id = await self._send_funpay_notification(
             message, author, user_id, keyboard
         )
-        if telegram_message_id is not None:
+        if notification is not None and telegram_message_id is not None:
             self.database.set_telegram_message_id(notification.id, telegram_message_id)
 
-        if is_first and self.database.get_bool("reminders_enabled", True):
+        if notification is not None and self.database.get_bool(
+            "reminders_enabled", True
+        ):
             self.reminders.start(notification.id)
 
     async def _send_funpay_notification(
@@ -275,15 +280,20 @@ class AutomationApp:
                 current_time = now.strftime("%H:%M")
                 current_slot = slot_key(now)
                 if self.funpay.connected:
-                    claimed: list[CategorySchedule] = []
+                    now_utc = now.astimezone(timezone.utc)
+                    claimed = self.database.claim_due_raise_retries(now_utc)
+                    claimed_ids = {category.category_id for category in claimed}
+                    retry_lease_until = now_utc + timedelta(minutes=15)
                     for category in self.database.list_categories():
-                        if (
-                            category.enabled
-                            and current_time in category.times
-                            and self.database.claim_raise_slot(
-                                category.category_id, current_slot
-                            )
-                        ):
+                        is_scheduled = (
+                            category.enabled and current_time in category.times
+                        )
+                        slot_claimed = is_scheduled and self.database.claim_raise_slot(
+                            category.category_id,
+                            current_slot,
+                            retry_claimed_until=retry_lease_until,
+                        )
+                        if slot_claimed and category.category_id not in claimed_ids:
                             claimed.append(category)
                     if claimed:
                         asyncio.create_task(
@@ -294,7 +304,7 @@ class AutomationApp:
                 raise
             except Exception:
                 logger.exception("Ошибка планировщика поднятий")
-            await asyncio.sleep(10)
+            await asyncio.sleep(2)
 
     async def _raise_batch(self, categories: list[CategorySchedule]) -> None:
         for category in categories:
@@ -358,43 +368,32 @@ class AutomationApp:
                 wait_seconds = await self._call_raise_with_spacing(category.category_id)
             except Exception as exc:  # noqa: BLE001 - persist any upstream raise failure.
                 detail, wait = self._raise_error(exc)
-                if wait is not None and 0 < wait <= 10:
-                    logger.warning(
-                        "FunPay попросил подождать %s сек. для категории %s; повторяю один раз",
-                        wait,
-                        category.category_id,
+                attempted_at = datetime.now(timezone.utc)
+                if wait is not None:
+                    retry_delay = max(
+                        self.config.category_raise_delay_seconds,
+                        float(wait),
                     )
-                    try:
-                        wait_seconds = await self._call_raise_with_spacing(
-                            category.category_id,
-                            minimum_wait=wait,
-                        )
-                    except Exception as retry_exc:  # noqa: BLE001 - persist retry failure too.
-                        detail, wait = self._raise_error(retry_exc)
-                    else:
-                        self._record_raise_success(
-                            category,
-                            wait_seconds,
-                            scheduled=scheduled,
-                        )
-                        logger.info(
-                            "Категория %s поднята %s после автоматического повтора",
-                            category.category_id,
-                            source,
-                        )
-                        return True
+                else:
+                    retry_delay = min(
+                        60.0 * (2 ** min(category.retry_attempts, 6)),
+                        60.0 * 60,
+                    )
+                retry_at = attempted_at + timedelta(seconds=retry_delay)
                 self.database.record_raise_result(
                     category.category_id,
                     success=False,
                     error=detail,
                     wait_seconds=wait,
-                    attempted_at=datetime.now(timezone.utc),
+                    attempted_at=attempted_at,
+                    retry_at=retry_at,
                 )
-                logger.error(
-                    "Категория %s не поднята %s: %s",
+                logger.warning(
+                    "Категория %s не поднята %s: %s. Автоповтор в %s",
                     category.category_id,
                     source,
                     detail,
+                    retry_at.isoformat(),
                 )
                 return False
 

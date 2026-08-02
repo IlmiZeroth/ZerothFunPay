@@ -114,8 +114,9 @@ class ReminderManager:
         return changed
 
     def stop_all(self) -> int:
-        stopped = self.database.stop_all_notifications()
+        stopped = 0
         for notification_id in list(self.tasks):
+            stopped += int(self.database.stop_notification(notification_id))
             self._cancel(notification_id)
         return stopped
 
